@@ -115,8 +115,8 @@ class HWC2Window : public HWComposerNativeWindow
     private:
         hwc2_compat_layer_t *layer;
         hwc2_compat_display_t *hwcDisplay;
-        int lastPresentFence = -1;
         bool m_syncBeforeSet;
+        HWComposerNativeWindowBuffer *m_lastBuffer = nullptr;
     protected:
         void present(HWComposerNativeWindowBuffer *buffer);
 
@@ -146,8 +146,12 @@ HWC2Window::HWC2Window(unsigned int width, unsigned int height,
 
 HWC2Window::~HWC2Window()
 {
-    if (lastPresentFence != -1) {
-        close(lastPresentFence);
+    if (m_lastBuffer != nullptr) {
+        int fenceFd = getFenceBufferFd(m_lastBuffer);
+        if (fenceFd != -1)
+            close(fenceFd);
+        setFenceBufferFd(m_lastBuffer, -1);
+        m_lastBuffer->common.decRef(&m_lastBuffer->common);
     }
 }
 
@@ -204,14 +208,23 @@ void HWC2Window::present(HWComposerNativeWindowBuffer *buffer)
 
     QPA_HWC_TIMING_SAMPLE(setTime);
 
-    if (lastPresentFence != -1) {
-        sync_wait(lastPresentFence, -1);
-        close(lastPresentFence);
+    setFenceBufferFd(buffer, -1);
+
+    // HWC2 present fences signal when the frame n is displayed on screen
+    // and the buffer for the previous frame n-1 is no longer needed.
+    if (m_lastBuffer != nullptr) {
+        int fenceFd = getFenceBufferFd(m_lastBuffer);
+        if (fenceFd != -1)
+            close(fenceFd);
+        setFenceBufferFd(m_lastBuffer, presentFence);
+        m_lastBuffer->common.decRef(&m_lastBuffer->common);
+    } else if (presentFence != -1) {
+        close(presentFence);
     }
 
-    lastPresentFence = presentFence != -1 ? dup(presentFence) : -1;
-
-    setFenceBufferFd(buffer, presentFence);
+    m_lastBuffer = buffer;
+    // Prevent the buffer from being destroyed if reallocation happens
+    m_lastBuffer->common.incRef(&m_lastBuffer->common);
 }
 
 int HwComposerBackend_v20::composerSequenceId = 0;
