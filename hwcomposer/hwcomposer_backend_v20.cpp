@@ -44,6 +44,7 @@
 #include "qeglfswindow.h"
 
 #include <string>
+#include <vector>
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QTimerEvent>
 #include <QtCore/QCoreApplication>
@@ -115,8 +116,10 @@ class HWC2Window : public HWComposerNativeWindow
     private:
         hwc2_compat_layer_t *layer;
         hwc2_compat_display_t *hwcDisplay;
-        int lastPresentFence = -1;
         bool m_syncBeforeSet;
+        HWComposerNativeWindowBuffer *m_lastBuffer = nullptr;
+        std::vector<HWComposerNativeWindowBuffer*> m_slotCache;
+        int m_nextSlot = 0;
     protected:
         void present(HWComposerNativeWindowBuffer *buffer);
 
@@ -141,13 +144,18 @@ HWC2Window::HWC2Window(unsigned int width, unsigned int height,
         // default to triple-buffering as on Android
         bufferCount = 3;
     setBufferCount(bufferCount);
+    m_slotCache.resize(bufferCount, nullptr);
     m_syncBeforeSet = qEnvironmentVariableIsSet("QPA_HWC_SYNC_BEFORE_SET");
 }
 
 HWC2Window::~HWC2Window()
 {
-    if (lastPresentFence != -1) {
-        close(lastPresentFence);
+    if (m_lastBuffer != nullptr) {
+        int fenceFd = getFenceBufferFd(m_lastBuffer);
+        if (fenceFd != -1)
+            close(fenceFd);
+        setFenceBufferFd(m_lastBuffer, -1);
+        m_lastBuffer->common.decRef(&m_lastBuffer->common);
     }
 }
 
@@ -192,9 +200,30 @@ void HWC2Window::present(HWComposerNativeWindowBuffer *buffer)
     QPA_HWC_TIMING_SAMPLE(prepareTime);
 
     QSystrace::begin("graphics", "QPA::set_client_target", "");
-    hwc2_compat_display_set_client_target(hwcDisplay, /* slot */0, buffer,
+
+    int slot = -1;
+    HWComposerNativeWindowBuffer *target = buffer;
+
+    // Check if the current buffer is cached in any slots
+    for (size_t i = 0; i < m_slotCache.size(); i++) {
+        if (m_slotCache[i] == buffer) {
+            target = nullptr;
+            slot = i;
+            break;
+        }
+    }
+
+    // If not found, use the next slot and update the cache
+    if (slot == -1) {
+        slot = m_nextSlot;
+        m_slotCache[slot] = buffer;
+        m_nextSlot = (m_nextSlot + 1) % m_slotCache.size();
+    }
+
+    hwc2_compat_display_set_client_target(hwcDisplay, slot, target,
                                           acquireFenceFd,
                                           HAL_DATASPACE_UNKNOWN);
+
     QSystrace::end("graphics", "QPA::set_client_target", "");
 
     QSystrace::begin("graphics", "QPA::present", "");
@@ -204,14 +233,23 @@ void HWC2Window::present(HWComposerNativeWindowBuffer *buffer)
 
     QPA_HWC_TIMING_SAMPLE(setTime);
 
-    if (lastPresentFence != -1) {
-        sync_wait(lastPresentFence, -1);
-        close(lastPresentFence);
+    setFenceBufferFd(buffer, -1);
+
+    // HWC2 present fences signal when the frame n is displayed on screen
+    // and the buffer for the previous frame n-1 is no longer needed.
+    if (m_lastBuffer != nullptr) {
+        int fenceFd = getFenceBufferFd(m_lastBuffer);
+        if (fenceFd != -1)
+            close(fenceFd);
+        setFenceBufferFd(m_lastBuffer, presentFence);
+        m_lastBuffer->common.decRef(&m_lastBuffer->common);
+    } else if (presentFence != -1) {
+        close(presentFence);
     }
 
-    lastPresentFence = presentFence != -1 ? dup(presentFence) : -1;
-
-    setFenceBufferFd(buffer, presentFence);
+    m_lastBuffer = buffer;
+    // Prevent the buffer from being destroyed if reallocation happens
+    m_lastBuffer->common.incRef(&m_lastBuffer->common);
 }
 
 int HwComposerBackend_v20::composerSequenceId = 0;
